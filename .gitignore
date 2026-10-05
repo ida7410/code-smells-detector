@@ -210,4 +210,4 @@ __marimo__/
 dataset/
 
 # docker
-code-smell-detector
+*.pth
