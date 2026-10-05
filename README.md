@@ -73,9 +73,17 @@ curl -X POST https://<api-id>.execute-api.ca-central-1.amazonaws.com/predict \
 
 The model runs as a container image on AWS Lambda behind API Gateway, with the image stored in ECR.
 
-- **Offline by design.** The base CodeBERT model and the fine-tuned weights are baked into the image, and the handler sets `TRANSFORMERS_OFFLINE=1`, so nothing is downloaded at runtime.
-- **Loaded once per container.** The model loads at import time, so warm requests skip the load.
+- **Offline by design.** The CodeBERT tokenizer, its config, and the fine-tuned weights are baked into the image, and the handler sets `TRANSFORMERS_OFFLINE=1`, so nothing is downloaded at runtime.
+- **No duplicate weights.** The fine-tuned checkpoint already contains every CodeBERT weight, so the handler builds the architecture from the config and loads the checkpoint directly. The pretrained weights are not in the image, which saves about 500 MB and one full model load.
+- **Loaded on the first request, once per container.** Lambda limits the init phase to 10 seconds and restarts it if a heavy import-time load overruns. Loading inside the handler avoids that, and warm requests reuse the loaded model.
+- **Checked on load.** The handler fails loudly if any learned weight is missing from the checkpoint, so it can never serve predictions from randomly initialized layers.
 - **CPU-only PyTorch.** The image installs `torch==2.0.1+cpu` to keep its size down.
+
+### Latency
+
+- **Warm requests** return in about 1.8 seconds.
+- **Cold starts** are slower and vary, because a new container has to load the 500 MB checkpoint. Measured cold starts ranged from about 9 seconds to over 30 seconds, which is past API Gateway's limit.
+- **Keep-warm schedule.** An EventBridge Scheduler rule invokes the function every five minutes with a small payload, so a container with the model loaded is normally available.
 
 Build and push (the image must target `linux/amd64` for Lambda):
 
@@ -111,5 +119,5 @@ python pipeline.py
 ## Limitations
 
 - **Weak labels.** The model is trained on rule-generated labels, so it learns to approximate those three rules. It is not validated against human judgments of code quality.
-- **Cold starts.** The first request after the function has been idle can exceed API Gateway's 30-second limit while the model loads. Later requests return quickly.
+- **Cold starts.** A request that lands on a cold container can take over 30 seconds and time out at API Gateway. Retrying succeeds once the container has loaded the model. The keep-warm schedule makes this rare but does not rule it out.
 - **Function-level only.** Inputs longer than 512 tokens are truncated.

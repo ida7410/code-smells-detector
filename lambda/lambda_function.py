@@ -1,44 +1,79 @@
 import json
 import os
+import traceback
 
-# MUST set these BEFORE importing transformers
+# MUST be set before transformers is imported
 os.environ['TRANSFORMERS_OFFLINE'] = '1'
 os.environ['HF_DATASETS_OFFLINE'] = '1'
 
-import torch
-from transformers import AutoTokenizer, AutoModel
-import torch.nn as nn
+MODEL_DIR = '/opt/ml/codebert'  # tokenizer files and config.json only
+WEIGHTS_PATH = '/opt/ml/model/code_smell_detector.pth'
+
+# Filled in by _load() on the first request, then reused while the container is warm
+_state = {}
 
 
-# Model definition
-class CodeSmellClassifier(nn.Module):
-    def __init__(self):
-        super(CodeSmellClassifier, self).__init__()
-        self.codebert = AutoModel.from_pretrained("/opt/ml/codebert", local_files_only=True)
-        self.classifier = nn.Linear(768, 2)
+def _load():
+    """Load the tokenizer and model once per container, on the first request.
 
-    def forward(self, input_ids):
-        outputs = self.codebert(input_ids)
-        cls_output = outputs.last_hidden_state[:, 0, :]
-        logits = self.classifier(cls_output)
-        return logits
+    This runs inside the handler rather than at import time on purpose.
+    Lambda limits the init phase to 10 seconds; if a heavy import-time load
+    overruns it, Lambda aborts the init and starts it again during the first
+    invocation, so the load would effectively run twice.
+    """
+    if _state:
+        return _state
 
+    import torch
+    import torch.nn as nn
+    from transformers import AutoConfig, AutoModel, AutoTokenizer
 
-# Load once at cold start
-print("Loading tokenizer...")
-tokenizer = AutoTokenizer.from_pretrained("/opt/ml/codebert", local_files_only=True)
-print("Loading model...")
-model = CodeSmellClassifier()
-print("Loading weights...")
-model.load_state_dict(torch.load('/opt/ml/model/code_smell_detector.pth', map_location='cpu'), strict=False)
-model.eval()
-print("Model ready!")
+    class CodeSmellClassifier(nn.Module):
+        def __init__(self):
+            super().__init__()
+            # Build the CodeBERT architecture from its config only. The
+            # fine-tuned checkpoint already contains every CodeBERT weight,
+            # so loading the pretrained weights first would be wasted work.
+            config = AutoConfig.from_pretrained(MODEL_DIR, local_files_only=True)
+            self.codebert = AutoModel.from_config(config)
+            self.classifier = nn.Linear(768, 2)
+
+        def forward(self, input_ids):
+            outputs = self.codebert(input_ids)
+            cls_output = outputs.last_hidden_state[:, 0, :]
+            return self.classifier(cls_output)
+
+    print("Loading tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR, local_files_only=True)
+
+    print("Building model and loading fine-tuned weights...")
+    model = CodeSmellClassifier()
+    result = model.load_state_dict(torch.load(WEIGHTS_PATH, map_location='cpu'), strict=False)
+
+    # The model starts from random weights, so every learned weight must come
+    # from the checkpoint. The only key allowed to be absent is the
+    # position_ids buffer, which is a fixed range and not a learned weight.
+    missing = [k for k in result.missing_keys if not k.endswith('position_ids')]
+    if missing or result.unexpected_keys:
+        raise RuntimeError(
+            f"Checkpoint does not match the model. Missing: {missing}. "
+            f"Unexpected: {list(result.unexpected_keys)}"
+        )
+
+    model.eval()
+    print("Model ready!")
+
+    _state.update(torch=torch, tokenizer=tokenizer, model=model)
+    return _state
 
 
 def lambda_handler(event, context):
     try:
         body = json.loads(event['body']) if 'body' in event else event
         code = body['code']
+
+        state = _load()
+        torch, tokenizer, model = state['torch'], state['tokenizer'], state['model']
 
         tokens = tokenizer.encode(
             code,
@@ -65,11 +100,9 @@ def lambda_handler(event, context):
         }
 
     except Exception as e:
-        import traceback
+        # Full traceback goes to CloudWatch; the caller only sees the message
+        print(traceback.format_exc())
         return {
             'statusCode': 500,
-            'body': json.dumps({
-                'error': str(e),
-                'traceback': traceback.format_exc()
-            })
+            'body': json.dumps({'error': str(e)})
         }
