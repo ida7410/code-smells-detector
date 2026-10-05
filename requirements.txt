@@ -6,3 +6,7 @@ scikit-learn
 torch
 transformers
 datasets
+bandit
+radon
+openai
+requests
